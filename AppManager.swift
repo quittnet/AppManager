@@ -1,4 +1,5 @@
 import AppKit
+import ServiceManagement
 import SwiftUI
 
 // MARK: - Process sampling
@@ -100,6 +101,10 @@ final class AppDropdownModel: ObservableObject {
   @Published private(set) var status: Status?
   @Published private(set) var isRestarting = false
 
+  @Published private(set) var loginStatus: SMAppService.Status = .notRegistered
+  private let readLoginStatus: () -> SMAppService.Status
+  private let setLoginEnabled: (Bool) throws -> Void
+
   private let runningApplications: () -> [any ManagedApplication]
   private let reopenApplication: (URL) async throws -> Void
   private var timer: Timer?
@@ -107,6 +112,14 @@ final class AppDropdownModel: ObservableObject {
   private var generation = 0
 
   init(
+    readLoginStatus: @escaping () -> SMAppService.Status = { SMAppService.mainApp.status },
+    setLoginEnabled: @escaping (Bool) throws -> Void = { enabled in
+      if enabled {
+        try SMAppService.mainApp.register()
+      } else {
+        try SMAppService.mainApp.unregister()
+      }
+    },
     runningApplications: @escaping () -> [any ManagedApplication] = {
       NSWorkspace.shared.runningApplications.filter {
         $0.activationPolicy == .regular
@@ -119,6 +132,8 @@ final class AppDropdownModel: ObservableObject {
       _ = try await NSWorkspace.shared.openApplication(at: url, configuration: configuration)
     }
   ) {
+    self.readLoginStatus = readLoginStatus
+    self.setLoginEnabled = setLoginEnabled
     self.runningApplications = runningApplications
     self.reopenApplication = reopenApplication
     refreshApps()
@@ -146,7 +161,45 @@ final class AppDropdownModel: ObservableObject {
     visibleRows.filter { checkedIDs.contains($0.id) }
   }
 
+  var launchesAtLogin: Bool {
+    loginStatus == .enabled || loginStatus == .requiresApproval
+  }
+
+  func refreshLoginStatus() {
+    loginStatus = readLoginStatus()
+  }
+
+  func setLaunchAtLogin(_ enabled: Bool) {
+    do {
+      try setLoginEnabled(enabled)
+      refreshLoginStatus()
+      if enabled && loginStatus == .requiresApproval {
+        status = Status(message: "Allow AppManager in System Settings > General > Login Items.")
+      } else if enabled && loginStatus != .enabled {
+        status = Status(message: "Launch at login could not be enabled. Try again.", isError: true)
+      } else {
+        status = nil
+      }
+    } catch {
+      refreshLoginStatus()
+      status = Status(
+        message: "Could not change launch at login: \(error.localizedDescription)", isError: true)
+    }
+  }
+
+  var canQuitAllExceptSelected: Bool {
+    !isRestarting && !selectedRows.isEmpty && selectedRows.count < rows.count
+  }
+
+  func quitAllExceptSelected() {
+    guard !isRestarting, !selectedRows.isEmpty else { return }
+    refreshApps()
+    guard canQuitAllExceptSelected else { return }
+    quit(rows: visibleRows.filter { !checkedIDs.contains($0.id) }, force: false)
+  }
+
   func start() {
+    refreshLoginStatus()
     guard timer == nil else { return }
     let timerGeneration = generation
     timer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
@@ -559,6 +612,9 @@ final class AppTableController: NSObject, NSTableViewDataSource, NSTableViewDele
     scrollView.borderType = .noBorder
     scrollView.hasVerticalScroller = false
     scrollView.hasHorizontalScroller = false
+    scrollView.autohidesScrollers = true
+    scrollView.verticalScrollElasticity = .none
+    scrollView.horizontalScrollElasticity = .none
     scrollView.automaticallyAdjustsContentInsets = false
     scrollView.documentView = tableView
   }
@@ -694,13 +750,16 @@ struct AppDropdownView: View {
               performAppAction(action, rows: model.selectedRows, model: model)
             }
           }
+          Divider()
+          Button("Quit All Except Selected") { model.quitAllExceptSelected() }
+            .disabled(!model.canQuitAllExceptSelected)
         } label: {
           Label("Actions", systemImage: "stop.circle")
         }
         .menuStyle(.borderlessButton)
         .fixedSize()
         .disabled(selectionCount == 0 || model.isRestarting)
-        .help("Quit, force quit, or restart selected apps")
+        .help("Quit, force quit, restart, or keep only selected apps")
         .accessibilityLabel("Actions for selected apps")
       }
       .padding(.horizontal, 16)
@@ -783,6 +842,15 @@ struct AppDropdownView: View {
           Button("Deselect All") { model.checkedIDs.removeAll() }
             .disabled(selectionCount == 0 || model.isRestarting)
           Divider()
+          Toggle(
+            "Launch at Login",
+            isOn: Binding(get: { model.launchesAtLogin }, set: { model.setLaunchAtLogin($0) })
+          )
+          .disabled(model.isRestarting)
+          if model.loginStatus == .requiresApproval {
+            Button("Allow in Login Items…") { SMAppService.openSystemSettingsLoginItems() }
+          }
+          Divider()
           Button("Quit AppManager") { NSApp.terminate(nil) }
             .disabled(model.isRestarting)
         } label: {
@@ -792,7 +860,7 @@ struct AppDropdownView: View {
         .menuIndicator(.hidden)
         .fixedSize()
         .accessibilityLabel("More options")
-        .help("Selection options and Quit AppManager")
+        .help("Selection options, launch at login, and Quit AppManager")
       }
       .font(.system(size: 11))
       .padding(.horizontal, 16)

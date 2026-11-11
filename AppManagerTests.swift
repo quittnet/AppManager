@@ -1,4 +1,5 @@
 import AppKit
+import ServiceManagement
 
 @MainActor
 final class TestApplication: NSObject, ManagedApplication {
@@ -118,10 +119,70 @@ struct AppManagerTests {
       tallFrame.height == 2000 && tallFrame.maxY == offsetDisplay.maxY - 4,
       "Tall lists must retain their full height and stay anchored below the menu bar.")
     precondition(!confirmForceQuit(names: []))
+    testQuitAllExceptSelected()
+    testLaunchAtLogin()
     testNativeSelection()
     testActionConfirmation()
     await testRestart()
     print("AppManager regression assertions passed. No real apps were quit.")
+  }
+
+  static func testQuitAllExceptSelected() {
+    let kept = TestApplication(pid: 501, name: "Keep")
+    let closed = TestApplication(pid: 502, name: "Close")
+    let late = TestApplication(pid: 503, name: "Opened Later")
+    var running: [any ManagedApplication] = [kept, closed]
+    let model = AppDropdownModel(runningApplications: { running })
+    model.quitAllExceptSelected()
+    precondition(kept.quitCount == 0 && closed.quitCount == 0)
+    model.checkedIDs = Set(model.rows.map(\.id))
+    precondition(!model.canQuitAllExceptSelected)
+    model.quitAllExceptSelected()
+    precondition(kept.quitCount == 0 && closed.quitCount == 0)
+    model.checkedIDs = [model.rows.first { $0.pid == kept.processIdentifier }!.id]
+    running.append(late)
+    model.quitAllExceptSelected()
+    precondition(kept.quitCount == 0 && closed.quitCount == 1 && late.quitCount == 1)
+    precondition(running.allSatisfy { ($0 as! TestApplication).forceQuitCount == 0 })
+    precondition(model.selectedRows.count == 1 && model.rows.count == 3)
+    precondition(model.status?.message.contains("save prompt") == true)
+    kept.isTerminated = true
+    running = [closed, late]
+    model.quitAllExceptSelected()
+    precondition(
+      closed.quitCount == 1 && late.quitCount == 1,
+      "If all selected apps closed, do not turn the action into Quit All.")
+  }
+
+  static func testLaunchAtLogin() {
+    var loginStatus: SMAppService.Status = .notRegistered
+    var shouldFail = false
+    var requested: [Bool] = []
+    let model = AppDropdownModel(
+      readLoginStatus: { loginStatus },
+      setLoginEnabled: { enabled in
+        requested.append(enabled)
+        if shouldFail { throw NSError(domain: "Test", code: 1) }
+        loginStatus = enabled ? .enabled : .notRegistered
+      },
+      runningApplications: { [] })
+    model.refreshLoginStatus()
+    precondition(!model.launchesAtLogin)
+    model.setLaunchAtLogin(true)
+    precondition(model.launchesAtLogin && model.status == nil)
+    model.setLaunchAtLogin(false)
+    precondition(!model.launchesAtLogin && requested == [true, false])
+    loginStatus = .requiresApproval
+    model.refreshLoginStatus()
+    precondition(model.launchesAtLogin && model.loginStatus == .requiresApproval)
+    shouldFail = true
+    model.setLaunchAtLogin(false)
+    precondition(model.launchesAtLogin && model.status?.isError == true)
+    let pending = AppDropdownModel(
+      readLoginStatus: { .requiresApproval }, setLoginEnabled: { _ in },
+      runningApplications: { [] })
+    pending.setLaunchAtLogin(true)
+    precondition(pending.status?.message.contains("System Settings") == true)
   }
 
   static func testNativeSelection() {

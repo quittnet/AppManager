@@ -1,0 +1,6 @@
+/AppManager
+/AppManager.app
+/AppManager.log
+/.AppManager.build.*
+/.appmanager-backups/
+.DS_Store

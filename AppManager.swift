@@ -4,27 +4,45 @@ import SwiftUI
 
 // MARK: - Process sampling
 
+/// Parses `ps -A -o pid=,ppid=,rss=` output and returns each app's resident
+/// memory plus that of every descendant process (renderers, GPU and plug-in
+/// helpers). A descendant counts toward its nearest app ancestor only, so an
+/// app launched by another app is never counted twice.
 func parseMemoryMB(_ output: String, for pids: Set<pid_t>) -> [pid_t: Double] {
-  var memory: [pid_t: Double] = [:]
+  var parent: [pid_t: pid_t] = [:]
+  var rssKB: [pid_t: Double] = [:]
   for line in output.split(whereSeparator: \.isNewline) {
     let columns = line.split(whereSeparator: \.isWhitespace)
-    guard columns.count == 2,
-      let pid = pid_t(columns[0]), pids.contains(pid),
-      let rssKB = Double(columns[1]), rssKB.isFinite, rssKB >= 0
+    guard columns.count == 3,
+      let pid = pid_t(columns[0]), let ppid = pid_t(columns[1]),
+      let rss = Double(columns[2]), rss.isFinite, rss >= 0
     else { continue }
-    // ps reports KiB. Convert to decimal MB to match the displayed MB/GB units.
-    memory[pid] = rssKB * 1024 / 1_000_000
+    parent[pid] = ppid
+    rssKB[pid] = rss
   }
-  return memory
+
+  var totalsKB: [pid_t: Double] = [:]
+  for pid in pids where rssKB[pid] != nil { totalsKB[pid] = 0 }
+  for (pid, rss) in rssKB {
+    // Walk up until an app is found. The step limit guards against PID reuse
+    // between rows producing a parent cycle.
+    var current = pid
+    var steps = 0
+    while !pids.contains(current), let next = parent[current], next != current, steps < 64 {
+      current = next
+      steps += 1
+    }
+    if totalsKB[current] != nil { totalsKB[current, default: 0] += rss }
+  }
+  // ps reports KiB. Convert to decimal MB to match the displayed MB/GB units.
+  return totalsKB.mapValues { $0 * 1024 / 1_000_000 }
 }
 
 func fetchMemoryMB(for pids: Set<pid_t>) -> [pid_t: Double]? {
   guard !pids.isEmpty else { return [:] }
   let process = Process()
   process.executableURL = URL(fileURLWithPath: "/bin/ps")
-  process.arguments = [
-    "-p", pids.sorted().map(String.init).joined(separator: ","), "-o", "pid=,rss=",
-  ]
+  process.arguments = ["-A", "-o", "pid=,ppid=,rss="]
   let pipe = Pipe()
   process.standardOutput = pipe
   process.standardError = FileHandle.nullDevice
@@ -36,9 +54,7 @@ func fetchMemoryMB(for pids: Set<pid_t>) -> [pid_t: Double]? {
   // Drain while ps runs: waiting first can deadlock when the pipe fills.
   let data = pipe.fileHandleForReading.readDataToEndOfFile()
   process.waitUntilExit()
-  // ps exits with 1 if every requested process has already exited.
-  guard process.terminationReason == .exit,
-    process.terminationStatus == 0 || process.terminationStatus == 1,
+  guard process.terminationReason == .exit, process.terminationStatus == 0,
     let output = String(data: data, encoding: .utf8)
   else { return nil }
   return parseMemoryMB(output, for: pids)
@@ -957,7 +973,7 @@ struct AppDropdownView: View {
       Spacer()
       Text("Memory")
         .help(
-          "Resident memory of the main process. Helper processes are not included. N/A means unavailable."
+          "Resident memory of the app and its helper processes. N/A means unavailable."
         )
     }
     .font(GlassStyle.labelFont)

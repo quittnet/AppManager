@@ -94,9 +94,19 @@ struct AppManagerTests {
       model.visibleRows.map(\.pid) == [101, 102], "Equal names need a stable tie-breaker.")
 
     let sample = parseMemoryMB(
-      "  101 1024\n102\t2048\n999 99\n101 nope\n103 -12\n104 nan\n105 inf\n",
+      "  101 1 1024\n102\t1\t2048\n999 1 99\n101 1 nope\n103 1 -12\n104 1 nan\n105 1 inf\n",
       for: [101, 102, 103, 104, 105])
     precondition(sample.count == 2 && sample[101] == 1.048576 && sample[102] == 2.097152)
+    // 201 is an app with a helper (202) and a grandchild (203). 204 is an app
+    // launched by 201 and keeps its own figure. 205 belongs to no app.
+    let tree = parseMemoryMB(
+      "1 0 10\n201 1 1000\n202 201 2000\n203 202 3000\n204 201 500\n205 1 7000\n206 204 250\n",
+      for: [201, 204, 300])
+    precondition(
+      tree.count == 2 && tree[201] == 6.144 && tree[204] == 0.768,
+      "Helpers count toward their nearest app ancestor only.")
+    let cycle = parseMemoryMB("401 402 100\n402 401 100\n", for: [403])
+    precondition(cycle.isEmpty, "A parent cycle must not hang or invent an app.")
     precondition(parseMemoryMB("", for: []).isEmpty)
     precondition(fetchMemoryMB(for: []) == [:])
     precondition(memoryLabel(megabytes: nil) == "N/A")

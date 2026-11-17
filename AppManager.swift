@@ -411,6 +411,119 @@ struct VisualEffectView: NSViewRepresentable {
   func updateNSView(_ nsView: NSVisualEffectView, context: Context) {}
 }
 
+// MARK: - Glass surfaces
+
+// The macOS 27 SDK also exports a State macro. Name the property wrapper
+// explicitly so Command Line Tools builds need no SwiftUI macro plugin.
+typealias ViewState<Value> = SwiftUI.State<Value>
+
+/// The glass language shared with ToggleDeck: frosted cards and capsule controls.
+enum GlassStyle {
+  static let panelRadius: CGFloat = 18
+  static let cardRadius: CGFloat = 14
+  static let panelInset: CGFloat = 10
+  static let controlHeight: CGFloat = 28
+  static let labelFont = Font.system(size: 11, weight: .semibold)
+}
+
+// Written out rather than with @Entry: some Command Line Tools releases ship
+// without the SwiftUI macro plugins.
+private struct UsesNativeGlassKey: EnvironmentKey {
+  static let defaultValue = true
+}
+
+extension EnvironmentValues {
+  /// False where the window server's glass cannot be captured, such as a PNG export.
+  var usesNativeGlass: Bool {
+    get { self[UsesNativeGlassKey.self] }
+    set { self[UsesNativeGlassKey.self] = newValue }
+  }
+}
+
+private struct GlassSurface<S: InsettableShape>: View {
+  let shape: S
+  @Environment(\.usesNativeGlass) private var usesNativeGlass
+  @Environment(\.colorScheme) private var scheme
+  @Environment(\.colorSchemeContrast) private var contrast
+  @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+
+  private var stroke: Color {
+    Color.primary.opacity(contrast == .increased ? 0.4 : 0.06)
+  }
+
+  var body: some View {
+    surface
+      .overlay {
+        if contrast == .increased { shape.strokeBorder(stroke, lineWidth: 1) }
+      }
+      .allowsHitTesting(false).accessibilityHidden(true)
+  }
+
+  @ViewBuilder private var surface: some View {
+    if reduceTransparency {
+      shape.fill(Color(nsColor: .controlBackgroundColor))
+        .overlay { shape.strokeBorder(stroke, lineWidth: 1) }
+    } else {
+      #if compiler(>=6.2)
+        if #available(macOS 26.0, *), usesNativeGlass {
+          // A neutral shade under light lettering keeps contrast over bright windows.
+          shape.fill(.black.opacity(scheme == .dark ? 0.35 : 0))
+            .glassEffect(.clear, in: shape)
+        } else {
+          frosted
+        }
+      #else
+        frosted
+      #endif
+    }
+  }
+
+  private var frosted: some View {
+    let dark = scheme == .dark
+    return shape.fill(.white.opacity(dark ? 0.085 : 0.66))
+      .shadow(color: .black.opacity(dark ? 0 : 0.07), radius: 1.5, y: 1)
+      .overlay {
+        shape.strokeBorder(
+          LinearGradient(
+            colors: [.white.opacity(dark ? 0.22 : 0.82), stroke],
+            startPoint: .top, endPoint: .bottom),
+          lineWidth: 1)
+      }
+  }
+}
+
+extension View {
+  func glassCard() -> some View {
+    background {
+      GlassSurface(shape: RoundedRectangle(cornerRadius: GlassStyle.cardRadius, style: .continuous))
+    }
+  }
+
+  func glassCapsule() -> some View {
+    background { GlassSurface(shape: Capsule()) }
+  }
+}
+
+/// A capsule control: hover and press tint inside the glass.
+struct GlassButtonStyle: ButtonStyle {
+  @ViewState<Bool> private var hovered = false
+  @Environment(\.isEnabled) private var enabled
+
+  func makeBody(configuration: Configuration) -> some View {
+    configuration.label
+      .frame(height: GlassStyle.controlHeight)
+      .background(
+        Color.primary.opacity(
+          enabled && configuration.isPressed ? 0.1 : (enabled && hovered ? 0.06 : 0)),
+        in: Capsule()
+      )
+      .glassCapsule()
+      .contentShape(Capsule())
+      .opacity(enabled ? 1 : 0.5)
+      .onHover { hovered = $0 }
+  }
+}
+
 enum AppAction: CaseIterable {
   case quit, forceQuit, restart
 
@@ -504,7 +617,7 @@ final class AppTableCell: NSTableCellView {
     textField = label
     NSLayoutConstraint.activate([
       label.centerYAnchor.constraint(equalTo: centerYAnchor),
-      label.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -12),
+      label.trailingAnchor.constraint(equalTo: trailingAnchor),
     ])
     if isMemory {
       label.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 4).isActive = true
@@ -516,7 +629,7 @@ final class AppTableCell: NSTableCellView {
       addSubview(icon)
       imageView = icon
       NSLayoutConstraint.activate([
-        icon.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 12),
+        icon.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 6),
         icon.centerYAnchor.constraint(equalTo: centerYAnchor),
         icon.widthAnchor.constraint(equalToConstant: 24),
         icon.heightAnchor.constraint(equalToConstant: 24),
@@ -543,7 +656,6 @@ final class AppTableCell: NSTableCellView {
 final class AppTableController: NSObject, NSTableViewDataSource, NSTableViewDelegate, NSMenuDelegate
 {
   static let rowHeight: CGFloat = 34
-  static let headerHeight: CGFloat = 25
 
   let tableView = AppTableView()
   let scrollView = NSScrollView()
@@ -557,7 +669,8 @@ final class AppTableController: NSObject, NSTableViewDataSource, NSTableViewDele
 
   override init() {
     super.init()
-    tableView.style = .fullWidth
+    // Rounded, inset selection that sits inside the glass card.
+    tableView.style = .inset
     tableView.rowHeight = Self.rowHeight
     tableView.intercellSpacing = .zero
     tableView.backgroundColor = .clear
@@ -566,23 +679,20 @@ final class AppTableController: NSObject, NSTableViewDataSource, NSTableViewDele
     tableView.allowsColumnReordering = false
     tableView.allowsColumnResizing = false
     tableView.columnAutoresizingStyle = .lastColumnOnlyAutoresizingStyle
-    tableView.headerView = NSTableHeaderView(
-      frame: NSRect(x: 0, y: 0, width: 360, height: Self.headerHeight))
+    // Column labels sit above the card in SwiftUI.
+    tableView.headerView = nil
     tableView.setAccessibilityLabel("Running apps")
     tableView.setAccessibilityHelp(
       "Select an app, or use Command or Shift to select multiple apps. Double-click or press Return to open an app."
     )
     let nameColumn = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("app"))
     nameColumn.title = "App"
-    nameColumn.width = 264
+    nameColumn.width = 220
     nameColumn.minWidth = 120
     let memoryColumn = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("memory"))
     memoryColumn.title = "Memory"
     memoryColumn.width = 96
     memoryColumn.minWidth = 80
-    memoryColumn.headerCell.alignment = .right
-    memoryColumn.headerToolTip =
-      "Resident memory of the main process. Helper processes are not included. N/A means unavailable."
     tableView.addTableColumn(nameColumn)
     tableView.addTableColumn(memoryColumn)
     tableView.delegate = self
@@ -736,36 +846,17 @@ struct AppDropdownView: View {
   let onClose: () -> Void
   let onContentChanged: () -> Void
 
+  private static let columnLabelHeight: CGFloat = 22
+  /// The inset table style pads the list above and below its rows.
+  private static let listPadding: CGFloat = 10
+
   var body: some View {
     let selectionCount = model.checkedIDs.count
 
     VStack(spacing: 0) {
-      HStack {
-        Text("Running Apps")
-          .font(.system(size: 13, weight: .semibold))
-        Spacer()
-        Menu {
-          ForEach(AppAction.allCases, id: \.self) { action in
-            Button(action.title) {
-              performAppAction(action, rows: model.selectedRows, model: model)
-            }
-          }
-          Divider()
-          Button("Quit All Except Selected") { model.quitAllExceptSelected() }
-            .disabled(!model.canQuitAllExceptSelected)
-        } label: {
-          Label("Actions", systemImage: "stop.circle")
-        }
-        .menuStyle(.borderlessButton)
-        .fixedSize()
-        .disabled(selectionCount == 0 || model.isRestarting)
-        .help("Quit, force quit, restart, or keep only selected apps")
-        .accessibilityLabel("Actions for selected apps")
-      }
-      .padding(.horizontal, 16)
-      .frame(height: 48)
+      header
 
-      Divider()
+      columnLabels
 
       AppListView(
         rows: model.visibleRows, memory: model.memoryMap,
@@ -777,8 +868,7 @@ struct AppDropdownView: View {
       )
       // The native table expands with its inventory; there is no capped scrolling region.
       .frame(
-        height: AppTableController.headerHeight + max(1, CGFloat(model.rows.count))
-          * AppTableController.rowHeight
+        height: Self.listPadding + max(1, CGFloat(model.rows.count)) * AppTableController.rowHeight
           + (model.rows.isEmpty ? 46 : 0)
       )
       .overlay {
@@ -787,13 +877,14 @@ struct AppDropdownView: View {
             Text("No running apps").font(.system(size: 13, weight: .medium))
             Text("Apps you open appear here.").font(.system(size: 12)).foregroundStyle(.secondary)
           }
-          .padding(.top, AppTableController.headerHeight)
           .allowsHitTesting(false)
         }
       }
+      .clipShape(RoundedRectangle(cornerRadius: GlassStyle.cardRadius, style: .continuous))
+      .glassCard()
+      .padding(.horizontal, GlassStyle.panelInset)
 
       if let status = model.status {
-        Divider()
         HStack(alignment: .top, spacing: 8) {
           if model.isRestarting {
             ProgressView().controlSize(.small).accessibilityHidden(true)
@@ -810,69 +901,131 @@ struct AppDropdownView: View {
           Spacer(minLength: 0)
         }
         .font(.system(size: 12))
-        .padding(.horizontal, 16)
-        .padding(.vertical, 10)
+        .padding(12)
+        .glassCard()
+        .padding(.horizontal, GlassStyle.panelInset)
+        .padding(.top, 8)
       }
 
-      Divider()
-
-      HStack(spacing: 12) {
-        Text(
-          selectionCount == 0
-            ? "\(model.rows.count) \(model.rows.count == 1 ? "app" : "apps")"
-            : "\(selectionCount) of \(model.rows.count) selected"
-        )
-        .foregroundStyle(.secondary)
-        .monospacedDigit()
-        Spacer(minLength: 0)
-        Button("Activity Monitor") {
-          let configuration = NSWorkspace.OpenConfiguration()
-          if let url = NSWorkspace.shared.urlForApplication(
-            withBundleIdentifier: "com.apple.ActivityMonitor")
-          {
-            NSWorkspace.shared.openApplication(at: url, configuration: configuration)
-            onClose()
-          }
-        }
-        .buttonStyle(.borderless)
-        .help("Open Activity Monitor for more process details")
-        Menu {
-          Button("Select All") { model.checkedIDs = Set(model.rows.map(\.id)) }
-            .disabled(model.rows.isEmpty || model.isRestarting)
-          Button("Deselect All") { model.checkedIDs.removeAll() }
-            .disabled(selectionCount == 0 || model.isRestarting)
-          Divider()
-          Toggle(
-            "Launch at Login",
-            isOn: Binding(get: { model.launchesAtLogin }, set: { model.setLaunchAtLogin($0) })
-          )
-          .disabled(model.isRestarting)
-          if model.loginStatus == .requiresApproval {
-            Button("Allow in Login Items…") { SMAppService.openSystemSettingsLoginItems() }
-          }
-          Divider()
-          Button("Quit AppManager") { NSApp.terminate(nil) }
-            .disabled(model.isRestarting)
-        } label: {
-          Image(systemName: "ellipsis.circle")
-        }
-        .menuStyle(.borderlessButton)
-        .menuIndicator(.hidden)
-        .fixedSize()
-        .accessibilityLabel("More options")
-        .help("Selection options, launch at login, and Quit AppManager")
-      }
-      .font(.system(size: 11))
-      .padding(.horizontal, 16)
-      .frame(height: 36)
+      footer(selectionCount: selectionCount)
+        .padding(.top, 10)
     }
     .frame(width: 360)
     .fixedSize(horizontal: false, vertical: true)
     .background(VisualEffectView())
-    .clipShape(RoundedRectangle(cornerRadius: 10))
+    .clipShape(RoundedRectangle(cornerRadius: GlassStyle.panelRadius, style: .continuous))
     .onChange(of: model.rows.count) { _, _ in onContentChanged() }
     .onChange(of: model.status?.message) { _, _ in onContentChanged() }
     .onExitCommand(perform: onClose)
+  }
+
+  private var header: some View {
+    HStack {
+      Text("Running Apps")
+        .font(.system(size: 13, weight: .semibold))
+      Spacer()
+      Menu {
+        ForEach(AppAction.allCases, id: \.self) { action in
+          Button(action.title) {
+            performAppAction(action, rows: model.selectedRows, model: model)
+          }
+        }
+        Divider()
+        Button("Quit All Except Selected") { model.quitAllExceptSelected() }
+          .disabled(!model.canQuitAllExceptSelected)
+      } label: {
+        Label("Actions", systemImage: "stop.circle")
+          .font(.system(size: 12, weight: .medium))
+          .padding(.horizontal, 12)
+      }
+      .menuStyle(.button)
+      .menuIndicator(.hidden)
+      .buttonStyle(GlassButtonStyle())
+      .fixedSize()
+      .disabled(model.checkedIDs.isEmpty || model.isRestarting)
+      .help("Quit, force quit, restart, or keep only selected apps")
+      .accessibilityLabel("Actions for selected apps")
+    }
+    .padding(.leading, GlassStyle.panelInset + 10)
+    .padding(.trailing, GlassStyle.panelInset)
+    .frame(height: 48)
+  }
+
+  private var columnLabels: some View {
+    HStack {
+      Text("App")
+      Spacer()
+      Text("Memory")
+        .help(
+          "Resident memory of the main process. Helper processes are not included. N/A means unavailable."
+        )
+    }
+    .font(GlassStyle.labelFont)
+    .foregroundStyle(.secondary)
+    // Lines up with the icons and the memory figures inside the inset table.
+    .padding(.horizontal, GlassStyle.panelInset + 24)
+    .frame(height: Self.columnLabelHeight, alignment: .top)
+  }
+
+  private func footer(selectionCount: Int) -> some View {
+    HStack(spacing: 8) {
+      Text(
+        selectionCount == 0
+          ? "\(model.rows.count) \(model.rows.count == 1 ? "app" : "apps")"
+          : "\(selectionCount) of \(model.rows.count) selected"
+      )
+      .foregroundStyle(.secondary)
+      .monospacedDigit()
+      Spacer(minLength: 0)
+      Button {
+        let configuration = NSWorkspace.OpenConfiguration()
+        if let url = NSWorkspace.shared.urlForApplication(
+          withBundleIdentifier: "com.apple.ActivityMonitor")
+        {
+          NSWorkspace.shared.openApplication(at: url, configuration: configuration)
+          onClose()
+        }
+      } label: {
+        Text("Activity Monitor").font(.system(size: 11, weight: .medium)).padding(.horizontal, 11)
+      }
+      .buttonStyle(GlassButtonStyle())
+      .help("Open Activity Monitor for more process details")
+      Menu {
+        Button("Select All") { model.checkedIDs = Set(model.rows.map(\.id)) }
+          .disabled(model.rows.isEmpty || model.isRestarting)
+        Button("Deselect All") { model.checkedIDs.removeAll() }
+          .disabled(selectionCount == 0 || model.isRestarting)
+        Divider()
+        Toggle(
+          "Launch at Login",
+          isOn: Binding(get: { model.launchesAtLogin }, set: { model.setLaunchAtLogin($0) })
+        )
+        .disabled(model.isRestarting)
+        if model.loginStatus == .requiresApproval {
+          Button("Allow in Login Items…") { SMAppService.openSystemSettingsLoginItems() }
+        }
+        Divider()
+        Button("Quit AppManager") { NSApp.terminate(nil) }
+          .disabled(model.isRestarting)
+      } label: {
+        Image(systemName: "ellipsis").font(.system(size: 12, weight: .medium))
+          .frame(width: GlassStyle.controlHeight)
+      }
+      .menuStyle(.button)
+      .menuIndicator(.hidden)
+      .buttonStyle(GlassButtonStyle())
+      .fixedSize()
+      .accessibilityLabel("More options")
+      .help("Selection options, launch at login, and Quit AppManager")
+    }
+    .font(.system(size: 11))
+    .padding(.leading, GlassStyle.panelInset + 10)
+    .padding(.trailing, GlassStyle.panelInset)
+    .frame(height: 44)
+    // An overlay, so the hairline adds no height.
+    .overlay(alignment: .top) {
+      Rectangle().fill(Color.primary.opacity(0.065)).frame(height: 1).accessibilityHidden(true)
+    }
   }
 }
 
